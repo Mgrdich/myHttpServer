@@ -27,3 +27,5 @@ go.work
 
 main-exec
 
+server.crt
+server.key
