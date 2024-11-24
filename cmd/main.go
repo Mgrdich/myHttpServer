@@ -1,14 +1,23 @@
 package main
 
 import (
-	"fmt"
-	"net"
+	"net/http"
+	"time"
 )
 
 func main() {
-	_, err := net.Listen("tcp", "127.0.0.1:8080")
+	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {})
+
+	server := &http.Server{
+		Addr:              "127.0.0.1:8080",
+		ReadHeaderTimeout: 3 * time.Second,
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+
+		}),
+	}
+
+	err := server.ListenAndServe()
 	if err != nil {
-		// handle error
-		fmt.Println(err)
+		return
 	}
 }

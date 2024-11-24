@@ -37,7 +37,6 @@ linters:
     - lll
     - misspell
     - nilerr
-    - nestif # let's remove it if it causes too much problems
     - noctx
     - unconvert
     - unparam
