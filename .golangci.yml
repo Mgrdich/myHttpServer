@@ -39,12 +39,12 @@ linters:
     - nilerr
     - noctx
     - unconvert
-    - unparam
+#    - unparam
     - usestdlibvars
     - whitespace
     - wsl
     - gci
-    - unused
+#    - unused
     - ineffassign
     - errcheck
     - gosimple

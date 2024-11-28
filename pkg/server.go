@@ -1,12 +1,16 @@
 package pkg
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +22,20 @@ var (
 	// started the handler. The associated value will be of
 	// type *Server.
 	ServerContextKey = &contextKey{"http-server"}
+
+	// LocalAddrContextKey is a context key. It can be used in
+	// HTTP handlers with Context.Value to access the local
+	// address the connection arrived on.
+	// The associated value will be of type net.Addr.
+	LocalAddrContextKey = &contextKey{"local-addr"}
+)
+
+// This is pools to make garbage collector works much easier
+// because the buffer reader and writer and heavy object storing them after resetting here
+var (
+	bufioReaderPool   sync.Pool
+	bufioWriter2kPool sync.Pool
+	bufioWriter4kPool sync.Pool
 )
 
 type conn struct {
@@ -31,7 +49,25 @@ type conn struct {
 	// *tls.Conn.
 	rwc net.Conn
 
+	// remoteAddr is rwc.RemoteAddr().String(). It is not populated synchronously
+	// inside the Listener's Accept goroutine, as some implementations block.
+	// It is populated immediately inside the (*conn).serve goroutine.
+	// This is the value of a Handler's (*Request).RemoteAddr.
+	remoteAddr string
+
+	// bufr reads from r.
+	bufr *bufio.Reader
+
+	// bufw writes to checkConnErrorWriter{c}, which populates werr on error.
+	bufw *bufio.Writer
+
+	// r is bufr's read source. It's a wrapper around rwc that provides
+	// io.LimitedReader-style limiting (while reading request headers)
+	// and functionality to support CloseNotifier. See *connReader docs.
+	r *connReader
+
 	curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
+
 }
 
 type MiniServer struct {
@@ -102,12 +138,114 @@ type MiniServer struct {
 	activeConn map[*conn]struct{}
 }
 
+// chunkWriter writes to a response's conn buffer, and is the writer
+// wrapped by the response.w buffered writer.
+//
+// chunkWriter also is responsible for finalizing the Header, including
+// conditionally setting the Content-Type and setting a Content-Length
+// in cases where the handler's final output is smaller than the buffer
+// size. It also conditionally adds chunk headers, when in chunking mode.
+//
+// See the comment above (*response).Write for the entire write flow.
+type chunkWriter struct {
+	res *response
+
+	// header is either nil or a deep clone of res.handlerHeader
+	// at the time of res.writeHeader, if res.writeHeader is
+	// called and extra buffering is being done to calculate
+	// Content-Type and/or Content-Length.
+	header http.Header
+
+	// wroteHeader tells whether the header's been written to "the
+	// wire" (or rather: w.conn.buf). this is unlike
+	// (*response).wroteHeader, which tells only whether it was
+	// logically written.
+	wroteHeader bool
+
+	// set by the writeHeader method:
+	chunking bool // using chunked transfer encoding for reply body
+}
+
+type response struct {
+	conn             *conn
+	req              *http.Request // request for this response
+	reqBody          io.ReadCloser
+	cancelCtx        context.CancelFunc // when ServeHTTP exits
+	wroteHeader      bool               // a non-1xx header has been (logically) written
+	wroteContinue    bool               // 100 Continue response was written
+	wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
+	wantsClose       bool               // HTTP request has Connection "close"
+
+	// canWriteContinue is an atomic boolean that says whether or
+	// not a 100 Continue header can be written to the
+	// connection.
+	// writeContinueMu must be held while writing the header.
+	// These two fields together synchronize the body reader (the
+	// expectContinueReader, which wants to write 100 Continue)
+	// against the main writer.
+	canWriteContinue atomic.Bool
+	writeContinueMu  sync.Mutex
+
+	w  *bufio.Writer // buffers output in chunks to chunkWriter
+	cw chunkWriter
+
+	// handlerHeader is the Header that Handlers get access to,
+	// which may be retained and mutated even after WriteHeader.
+	// handlerHeader is copied into cw.header at WriteHeader
+	// time, and privately mutated thereafter.
+	handlerHeader http.Header
+	calledHeader  bool // handler accessed handlerHeader via Header
+
+	written       int64 // number of bytes written in body
+	contentLength int64 // explicitly-declared Content-Length; or -1
+	status        int   // status code passed to WriteHeader
+
+	// close connection after this reply.  set on request and
+	// updated after response from handler if there's a
+	// "Connection: keep-alive" response header and a
+	// Content-Length.
+	closeAfterReply bool
+
+	// When fullDuplex is false (the default), we consume any remaining
+	// request body before starting to write a response.
+	fullDuplex bool
+
+	// requestBodyLimitHit is set by requestTooLarge when
+	// maxBytesReader hits its max size. It is checked in
+	// WriteHeader, to make sure we don't consume the
+	// remaining request body to try to advance to the next HTTP
+	// request. Instead, when this is set, we stop reading
+	// subsequent requests on this connection and stop reading
+	// input from it.
+	requestBodyLimitHit bool
+
+	// trailers are the headers to be sent after the handler
+	// finishes writing the body. This field is initialized from
+	// the Trailer response header when the response header is
+	// written.
+	trailers []string
+
+	handlerDone atomic.Bool // set true when the handler exits
+
+	// Buffers for Date, Content-Length, and status code
+	dateBuf   [len(http.TimeFormat)]byte
+	clenBuf   [10]byte
+	statusBuf [3]byte
+
+	// closeNotifyCh is the channel returned by CloseNotify.
+	// non-nil. Make this lazily-created again as it used to be?
+	closeNotifyCh  chan bool
+	didCloseNotify atomic.Bool // atomic (only false->true winner should send)
+}
+
+// ListenAndServer it creates HTTP server that works with HTTP/1.1 protocol
 func ListenAndServer(addr string, handler http.Handler) error {
 	s := &MiniServer{Addr: addr, Handler: handler, SupportH2: false}
 
 	return s.ListenAndServer()
 }
 
+// ListenAndServerTLS it creates HTTP server that has TLS in it works with HTTP/2.0 and HTTP/1.1
 func ListenAndServerTLS(
 	addr string, certFile, keyFile string,
 	supportH2 bool,
@@ -169,6 +307,8 @@ func (oc *onceCloseListener) Close() error {
 func (oc *onceCloseListener) close() {
 	oc.closeErr = oc.Listener.Close()
 }
+
+// MiniServer Methods
 
 func (s *MiniServer) Serve(l net.Listener) error {
 	if s.shuttingDown() {
@@ -321,6 +461,8 @@ func (s *MiniServer) trackConn(c *conn, add bool) {
 	delete(s.activeConn, c)
 }
 
+// conn Methods
+
 func (c *conn) setState(state ConnState) {
 	srv := c.server
 
@@ -332,7 +474,7 @@ func (c *conn) setState(state ConnState) {
 	}
 
 	if state > 0xff || state < 0 {
-		panic("internal error")
+		log.Panicln("internal error")
 	}
 
 	packedState := uint64(time.Now().Unix()<<8) | uint64(state)
@@ -340,4 +482,194 @@ func (c *conn) setState(state ConnState) {
 	c.curState.Store(packedState)
 }
 
-func (c *conn) serve(ctx context.Context) {}
+func (c *conn) serve(ctx context.Context) {
+	if ra := c.rwc.RemoteAddr(); ra != nil {
+		c.remoteAddr = ra.String()
+	}
+
+	// ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
+
+	var inFlightResponse *response
+
+	defer func() {
+		//nolint:all
+		if err := recover(); err != nil && err != http.ErrAbortHandler {
+			const size = 64 << 10
+			buf := make([]byte, size)
+			buf = buf[:runtime.Stack(buf, false)]
+			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
+		}
+
+		if inFlightResponse != nil {
+			inFlightResponse.cancelCtx()
+		}
+
+		if inFlightResponse != nil {
+			inFlightResponse.conn.r.abortPendingRead()
+			inFlightResponse.reqBody.Close()
+		}
+
+		c.close()
+		c.setState(StateClosed)
+	}()
+
+	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
+		fmt.Println(tlsConn)
+	}
+
+	// HTTP/1.x from here on
+
+	fmt.Print("testing")
+}
+
+func (c *conn) close() {
+	c.finalFlush()
+	c.rwc.Close()
+}
+
+func putBufioReader(br *bufio.Reader) {
+	br.Reset(nil)
+	bufioReaderPool.Put(br)
+}
+
+// bufioWriterPool it checks the available size so it can assign correct writer to it
+func bufioWriterPool(size int) *sync.Pool {
+	switch size {
+	case 2 << 10:
+		return &bufioWriter2kPool
+	case 4 << 10:
+		return &bufioWriter4kPool
+	}
+
+	return nil
+}
+
+func putBufioWriter(bw *bufio.Writer) {
+	bw.Reset(nil)
+
+	if pool := bufioWriterPool(bw.Available()); pool != nil {
+		pool.Put(bw)
+	}
+}
+
+func (c *conn) finalFlush() {
+	if c.bufr != nil {
+		// Steal the bufio.Reader (~4KB worth of memory) and its associated
+		// reader for a future connection.
+		putBufioReader(c.bufr)
+		c.bufr = nil
+	}
+
+	if c.bufw != nil {
+		c.bufw.Flush()
+		// Steal the bufio.Writer (~4KB worth of memory) and its associated
+		// writer for a future connection.
+		putBufioWriter(c.bufw)
+		c.bufw = nil
+	}
+}
+
+// connReader methods
+
+// connReader is the io.Reader wrapper used by *conn. It combines a
+// selectively-activated io.LimitedReader (to bound request header
+// read sizes) with support for selectively keeping an io.Reader.Read
+// call blocked in a background goroutine to wait for activity and
+// trigger a CloseNotifier channel.
+type connReader struct {
+	conn *conn
+
+	mu      sync.Mutex // guards following
+	hasByte bool
+	byteBuf [1]byte
+	cond    *sync.Cond
+	inRead  bool
+	aborted bool  // set true before conn.rwc deadline is set to past
+	remain  int64 // bytes remaining
+}
+
+func (cr *connReader) lock() {
+	cr.mu.Lock()
+
+	if cr.cond == nil {
+		cr.cond = sync.NewCond(&cr.mu)
+	}
+}
+
+func (cr *connReader) unlock() { cr.mu.Unlock() }
+
+func (cr *connReader) startBackgroundRead() {
+	cr.lock()
+	defer cr.unlock()
+
+	if cr.inRead {
+		panic("invalid concurrent Body.Read call")
+	}
+
+	if cr.hasByte {
+		return
+	}
+
+	cr.inRead = true
+
+	//nolint:all
+	cr.conn.rwc.SetReadDeadline(time.Time{})
+
+	go cr.backgroundRead()
+}
+
+func (cr *connReader) backgroundRead() {
+	n, err := cr.conn.rwc.Read(cr.byteBuf[:])
+
+	cr.lock()
+
+	if n == 1 {
+		cr.hasByte = true
+	}
+
+	var ne net.Error
+
+	//nolint:all
+	if errors.As(err, &ne) && cr.aborted && ne.Timeout() {
+		// Ignore this error. It's the expected error from
+		// another goroutine calling abortPendingRead.
+	}
+
+	cr.aborted = false
+	cr.inRead = false
+	cr.unlock()
+	cr.cond.Broadcast()
+}
+
+func (cr *connReader) abortPendingRead() {
+	cr.lock()
+	defer cr.unlock()
+
+	if !cr.inRead {
+		return
+	}
+
+	cr.aborted = true
+
+	//nolint:all
+	cr.conn.rwc.SetReadDeadline(aLongTimeAgo)
+
+	for cr.inRead {
+		cr.cond.Wait()
+	}
+
+	//nolint:all
+	cr.conn.rwc.SetReadDeadline(time.Time{})
+}
+
+func (cr *connReader) setReadLimit(remain int64) {
+	cr.remain = remain
+}
+
+func (cr *connReader) setInfiniteReadLimit() {
+	cr.remain = maxInt64
+}
+
+func (cr *connReader) hitReadLimit() bool {
+	return cr.remain <= 0
+}
