@@ -591,8 +591,10 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	}
 
 	writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
+	//nolint:errcheck
 	cw.header.WriteSubset(w.conn.bufw, excludeHeader)
 	setHeader.Write(w.conn.bufw)
+	//nolint:errcheck
 	w.conn.bufw.Write(crlf)
 }
 
@@ -641,13 +643,16 @@ func (cw *chunkWriter) close() {
 	if cw.chunking {
 		bw := cw.res.conn.bufw // conn's bufio writer
 		// zero chunk to mark EOF
+		//nolint:errcheck
 		bw.WriteString("0\r\n")
 
 		if trailers := cw.res.finalTrailers(); trailers != nil {
+			//nolint:errcheck
 			trailers.Write(bw) // the writer handles noting errors
 		}
 		// final blank line after the trailers (whether
 		// present or not)
+		//nolint:errcheck
 		bw.WriteString("\r\n")
 	}
 }
@@ -1057,15 +1062,21 @@ func (w *response) requestTooLarge() {
 // scratch is an optional scratch buffer. If it has at least capacity 3, it's used.
 func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
 	if is11 {
+		//nolint:errcheck
 		bw.WriteString("HTTP/1.1 ")
 	} else {
+		//nolint:errcheck
 		bw.WriteString("HTTP/1.0 ")
 	}
 
 	if text := http.StatusText(code); text != "" {
+		//nolint:errcheck
 		bw.Write(strconv.AppendInt(scratch[:0], int64(code), 10))
+		//nolint:errcheck
 		bw.WriteByte(' ')
+		//nolint:errcheck
 		bw.WriteString(text)
+		//nolint:errcheck
 		bw.WriteString("\r\n")
 	} else {
 		// don't worry about performance
@@ -1095,8 +1106,11 @@ func (w *response) WriteHeader(code int) {
 		writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
 
 		// Per RFC 8297 we must not clear the current header map
+		//nolint:all
 		w.handlerHeader.WriteSubset(w.conn.bufw, excludedHeadersNoBody)
+		//nolint:all
 		w.conn.bufw.Write(crlf)
+		//nolint:all
 		w.conn.bufw.Flush()
 
 		return
@@ -1139,6 +1153,7 @@ func (w *response) finishRequest() {
 	w.reqBody.Close()
 
 	if w.req.MultipartForm != nil {
+		//nolint:errcheck
 		w.req.MultipartForm.RemoveAll()
 	}
 }
@@ -1457,6 +1472,7 @@ func (c *conn) closeWriteAndWait() {
 	c.finalFlush()
 
 	if tcp, ok := c.rwc.(closeWriter); ok {
+		//nolint:errcheck
 		tcp.CloseWrite()
 	}
 
@@ -1706,7 +1722,9 @@ func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
 		w.writeContinueMu.Lock()
 
 		if w.canWriteContinue.Load() {
+			//nolint:errcheck
 			w.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+			//nolint:errcheck
 			w.conn.bufw.Flush()
 			w.canWriteContinue.Store(false)
 		}
@@ -1748,22 +1766,32 @@ type extraHeader struct {
 // smart enough to realize this function doesn't mutate h.
 func (h extraHeader) Write(w *bufio.Writer) {
 	if h.date != nil {
+		//nolint:errcheck
 		w.Write(headerDate)
+		//nolint:errcheck
 		w.Write(h.date)
+		//nolint:errcheck
 		w.Write(crlf)
 	}
 
 	if h.contentLength != nil {
+		//nolint:errcheck
 		w.Write(headerContentLength)
+		//nolint:errcheck
 		w.Write(h.contentLength)
+		//nolint:errcheck
 		w.Write(crlf)
 	}
 
 	for i, v := range []string{h.contentType, h.connection, h.transferEncoding} {
 		if v != "" {
+			//nolint:errcheck
 			w.Write(extraHeaderKeys[i])
+			//nolint:errcheck
 			w.Write(colonSpace)
+			//nolint:errcheck
 			w.WriteString(v)
+			//nolint:errcheck
 			w.Write(crlf)
 		}
 	}
@@ -1882,8 +1910,9 @@ func (b *body) readTrailer() error {
 	// The common case, since nobody uses trailers.
 	buf, err := b.r.Peek(2)
 	if bytes.Equal(buf, singleCRLF) {
-		b.r.Discard(2)
-		return nil
+		_, err = b.r.Discard(2)
+
+		return err
 	}
 
 	if len(buf) < 2 {

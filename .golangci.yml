@@ -24,7 +24,7 @@ linters:
   enable:
     - bodyclose
 #    - dupl temporary
-#    - errcheck
+    - errcheck
     - asasalint
     - asciicheck
     - containedctx
