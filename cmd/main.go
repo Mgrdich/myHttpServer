@@ -1,23 +1,31 @@
 package main
 
 import (
+	"log"
 	"net/http"
-	"time"
+
+	"myHttpServer/pkg"
 )
 
 func main() {
-	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {})
+	//err := pkg.ListenAndServerTLS(
+	//	"127.0.0.1:8080",
+	//	"server.crt",
+	//	"server.key",
+	//	true,
+	//	http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	//		log.Println(w, r)
+	//	}))
+	//
+	//if err != nil {
+	//	log.Panic(err)
+	//}
+	err := pkg.ListenAndServer("127.0.0.1:8080",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Println(w, r)
+		}))
 
-	server := &http.Server{
-		Addr:              "127.0.0.1:8080",
-		ReadHeaderTimeout: 3 * time.Second,
-		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-
-		}),
-	}
-
-	err := server.ListenAndServe()
 	if err != nil {
-		return
+		log.Panic(err)
 	}
 }
