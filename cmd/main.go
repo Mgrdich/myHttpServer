@@ -8,8 +8,9 @@ import (
 )
 
 func main() {
+	// own package
 	//err := pkg.ListenAndServerTLS(
-	//	"127.0.0.1:8080",
+	//	"https://127.0.0.1:8080",
 	//	"server.crt",
 	//	"server.key",
 	//	true,

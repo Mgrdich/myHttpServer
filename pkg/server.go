@@ -731,6 +731,10 @@ type response struct {
 
 // ListenAndServer it creates HTTP server that works with HTTP/1.1 protocol
 func ListenAndServer(addr string, handler http.Handler) error {
+	if handler == nil {
+		log.Panic("handler can't be nil")
+	}
+
 	s := &MiniServer{Addr: addr, Handler: handler, SupportH2: false}
 
 	return s.ListenAndServer()
@@ -741,6 +745,10 @@ func ListenAndServerTLS(
 	addr string, certFile, keyFile string,
 	supportH2 bool,
 	handler http.Handler) error {
+	if handler == nil {
+		log.Panic("handler can't be nil")
+	}
+
 	s := &MiniServer{
 		Addr:      addr,
 		Handler:   handler,
@@ -891,6 +899,14 @@ func (s *MiniServer) newConn(con net.Conn) *conn {
 
 func (s *MiniServer) doKeepAlives() bool {
 	return !s.disableKeepAlives.Load() && !s.shuttingDown()
+}
+
+func (s *MiniServer) idleTimeout() time.Duration {
+	if s.IdleTimeout != 0 {
+		return s.IdleTimeout
+	}
+
+	return s.ReadTimeout
 }
 
 // A ConnState represents the state of a client connection to a server.
@@ -1056,6 +1072,94 @@ func (w *response) requestTooLarge() {
 	}
 }
 
+// bodyAllowed reports whether a Write is allowed for this response type.
+// It's illegal to call this before the header has been flushed.
+func (w *response) bodyAllowed() bool {
+	if !w.wroteHeader {
+		panic("")
+	}
+
+	return bodyAllowedForStatus(w.status)
+}
+
+// The Life Of A Write is like this:
+//
+// Handler starts. No header has been sent. The handler can either
+// write a header, or just start writing. Writing before sending a header
+// sends an implicitly empty 200 OK header.
+//
+// If the handler didn't declare a Content-Length up front, we either
+// go into chunking mode or, if the handler finishes running before
+// the chunking buffer size, we compute a Content-Length and send that
+// in the header instead.
+//
+// Likewise, if the handler didn't set a Content-Type, we sniff that
+// from the initial chunk of output.
+//
+// The Writers are wired together like:
+//
+//  1. *response (the ResponseWriter) ->
+//  2. (*response).w, a *bufio.Writer of bufferBeforeChunkingSize bytes ->
+//  3. chunkWriter.Writer (whose writeHeader finalizes Content-Length/Type)
+//     and which writes the chunk headers, if needed ->
+//  4. conn.bufw, a *bufio.Writer of default (4kB) bytes, writing to ->
+//  5. checkConnErrorWriter{c}, which notes any non-nil error on Write
+//     and populates c.werr with it if so, but otherwise writes to ->
+//  6. the rwc, the net.Conn.
+//
+// TODO(bradfitz): short-circuit some of the buffering when the
+// initial header contains both a Content-Type and Content-Length.
+// Also short-circuit in (1) when the header's been sent and not in
+// chunking mode, writing directly to (4) instead, if (2) has no
+// buffered data. More generally, we could short-circuit from (1) to
+// (3) even in chunking mode if the write size from (1) is over some
+// threshold and nothing is in (2).  The answer might be mostly making
+// bufferBeforeChunkingSize smaller and having bufio's fast-paths deal
+// with this instead.
+func (w *response) Write(data []byte) (n int, err error) {
+	return w.write(len(data), data, "")
+}
+
+func (w *response) WriteString(data string) (n int, err error) {
+	return w.write(len(data), nil, data)
+}
+
+// either dataB or dataS is non-zero.
+func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err error) {
+	if w.canWriteContinue.Load() {
+		// Body reader wants to write 100 Continue but hasn't yet.
+		// Tell it not to. The store must be done while holding the lock
+		// because the lock makes sure that there is not an active write
+		// this very moment.
+		w.writeContinueMu.Lock()
+		w.canWriteContinue.Store(false)
+		w.writeContinueMu.Unlock()
+	}
+
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	if lenData == 0 {
+		return 0, nil
+	}
+
+	if !w.bodyAllowed() {
+		return 0, http.ErrBodyNotAllowed
+	}
+
+	w.written += int64(lenData) // ignoring errors, for errorKludge
+	if w.contentLength != -1 && w.written > w.contentLength {
+		return 0, http.ErrContentLength
+	}
+
+	if dataB != nil {
+		return w.w.Write(dataB)
+	} else {
+		return w.w.WriteString(dataS)
+	}
+}
+
 // writeStatusLine writes an HTTP/1.x Status-Line (RFC 7230 Section 3.1.2)
 // to bw. is11 is whether the HTTP request is HTTP/1.1. false means HTTP/1.0.
 // code is the response status code.
@@ -1158,6 +1262,40 @@ func (w *response) finishRequest() {
 	}
 }
 
+func (w *response) closedRequestBodyEarly() bool {
+	body, ok := w.req.Body.(*body)
+
+	return ok && body.didEarlyClose()
+}
+
+// shouldReuseConnection reports whether the underlying TCP connection can be reused.
+// It must only be called after the handler is done executing.
+func (w *response) shouldReuseConnection() bool {
+	if w.closeAfterReply {
+		// The request or something set while executing the
+		// handler indicated we shouldn't reuse this
+		// connection.
+		return false
+	}
+
+	if w.req.Method != http.MethodHead && w.contentLength != -1 && w.bodyAllowed() && w.contentLength != w.written {
+		// Did not write enough. Avoid getting out of sync.
+		return false
+	}
+
+	// There was some error writing to the underlying connection
+	// during the request, so don't re-use this conn.
+	if w.conn.werr != nil {
+		return false
+	}
+
+	if w.closedRequestBodyEarly() {
+		return false
+	}
+
+	return true
+}
+
 // TrailerPrefix is a magic prefix for ResponseWriter.Header map keys
 // that, if present, signals that the map entry is actually for
 // the response trailers, and not the response headers. The prefix
@@ -1222,6 +1360,35 @@ func (c *conn) setState(state ConnState) {
 	c.curState.Store(packedState)
 }
 
+func registerOnHitEOF(rc io.ReadCloser, fn func()) {
+	switch v := rc.(type) {
+	case *expectContinueReader:
+		registerOnHitEOF(v.readCloser, fn)
+	case *body:
+		v.registerOnHitEOF(fn)
+	default:
+		panic("unexpected type " + fmt.Sprintf("%T", rc))
+	}
+}
+
+// requestBodyRemains reports whether future calls to Read
+// on rc might yield more data.
+func requestBodyRemains(rc io.ReadCloser) bool {
+	if rc == http.NoBody {
+		return false
+	}
+
+	switch v := rc.(type) {
+	case *expectContinueReader:
+		return requestBodyRemains(v.readCloser)
+	case *body:
+		return v.bodyRemains()
+	default:
+		panic("unexpected type " + fmt.Sprintf("%T", rc))
+	}
+}
+
+// TODO serve is incomplete
 func (c *conn) serve(ctx context.Context) {
 	if ra := c.rwc.RemoteAddr(); ra != nil {
 		c.remoteAddr = ra.String()
@@ -1267,6 +1434,7 @@ func (c *conn) serve(ctx context.Context) {
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
+	// each request from a single connection
 	for {
 		w, err := c.readRequest(ctx)
 
@@ -1276,69 +1444,67 @@ func (c *conn) serve(ctx context.Context) {
 		}
 
 		if err != nil {
-			if err != nil {
-				const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+			const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
 
-				switch {
-				case errors.Is(err, errTooLarge):
-					// Their HTTP client may or may not be
-					// able to read this if we're
-					// responding to them and hanging up
-					// while they're still writing their
-					// request. Undefined behavior.
-					const publicErr = "431 Request Header Fields Too Large"
+			switch {
+			case errors.Is(err, errTooLarge):
+				// Their HTTP client may or may not be
+				// able to read this if we're
+				// responding to them and hanging up
+				// while they're still writing their
+				// request. Undefined behavior.
+				const publicErr = "431 Request Header Fields Too Large"
 
-					fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
+				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
 
-					c.closeWriteAndWait()
+				c.closeWriteAndWait()
 
-					return
+				return
 
-				case isUnsupportedTEError(err):
-					// Respond as per RFC 7230 Section 3.3.1 which says,
-					//      A server that receives a request message with a
-					//      transfer coding it does not understand SHOULD
-					//      respond with 501 (Unimplemented).
-					code := http.StatusNotImplemented
+			case isUnsupportedTEError(err):
+				// Respond as per RFC 7230 Section 3.3.1 which says,
+				//      A server that receives a request message with a
+				//      transfer coding it does not understand SHOULD
+				//      respond with 501 (Unimplemented).
+				code := http.StatusNotImplemented
 
-					// We purposefully aren't echoing back the transfer-encoding's value,
-					// so as to mitigate the risk of cross side scripting by an attacker.
-					fmt.Fprintf(
-						c.rwc,
-						"HTTP/1.1 %d %s%sUnsupported transfer encoding",
-						code,
-						http.StatusText(code),
+				// We purposefully aren't echoing back the transfer-encoding's value,
+				// so as to mitigate the risk of cross side scripting by an attacker.
+				fmt.Fprintf(
+					c.rwc,
+					"HTTP/1.1 %d %s%sUnsupported transfer encoding",
+					code,
+					http.StatusText(code),
+					errorHeaders,
+				)
+
+				return
+
+			case isCommonNetReadError(err):
+				return // don't reply
+
+			default:
+				var v statusError
+
+				if errors.As(err, &v) {
+					fmt.Fprintf(c.rwc,
+						"HTTP/1.1 %d %s: %s%s%d %s: %s",
+						v.code,
+						http.StatusText(v.code),
+						v.text,
 						errorHeaders,
+						v.code,
+						http.StatusText(v.code),
+						v.text,
 					)
 
 					return
-
-				case isCommonNetReadError(err):
-					return // don't reply
-
-				default:
-					var v statusError
-
-					if errors.As(err, &v) {
-						fmt.Fprintf(c.rwc,
-							"HTTP/1.1 %d %s: %s%s%d %s: %s",
-							v.code,
-							http.StatusText(v.code),
-							v.text,
-							errorHeaders,
-							v.code,
-							http.StatusText(v.code),
-							v.text,
-						)
-
-						return
-					}
-
-					publicErr := "400 Bad Request"
-					fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
-
-					return
 				}
+
+				publicErr := "400 Bad Request"
+				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
+
+				return
 			}
 		}
 
@@ -1355,12 +1521,77 @@ func (c *conn) serve(ctx context.Context) {
 			w.sendExpectationFailed()
 			return
 		}
+
+		c.curReq.Store(w)
+
+		if requestBodyRemains(req.Body) {
+			registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
+		} else {
+			w.conn.r.startBackgroundRead()
+		}
+
+		// HTTP cannot have multiple simultaneous active requests.[*]
+		// Until the server replies to this request, it can't read another,
+		// so we might as well run the handler in this goroutine.
+		// [*] Not strictly true: HTTP pipelining. We could let them all process
+		// in parallel even if their responses need to be serialized.
+		// But we're not going to implement HTTP pipelining because it
+		// was never deployed in the wild and the answer is HTTP/2.
+		inFlightResponse = w
+		serverHandler{c.server}.ServeHTTP(w, w.req)
+
+		inFlightResponse = nil
+
+		w.cancelCtx()
+		w.finishRequest()
+
+		//nolint:errcheck
+		c.rwc.SetWriteDeadline(time.Time{})
+
+		if !w.shouldReuseConnection() {
+			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
+				c.closeWriteAndWait()
+			}
+
+			return
+		}
+
+		c.setState(StateIdle)
+		c.curReq.Store(nil)
+
+		if !w.conn.server.doKeepAlives() {
+			// We're in shutdown mode. We might've replied
+			// to the user without "Connection: close" and
+			// they might think they can send another
+			// request, but such is life with HTTP/1.1.
+			return
+		}
+
+		if d := c.server.idleTimeout(); d != 0 {
+			//nolint:errcheck
+			c.rwc.SetReadDeadline(time.Now().Add(d))
+		} else {
+			//nolint:errcheck
+			c.rwc.SetReadDeadline(time.Time{})
+		}
+
+		// Wait for the connection to become readable again before trying to
+		// read the next request. This prevents a ReadHeaderTimeout or
+		// ReadTimeout from starting until the first bytes of the next request
+		// have been received.
+		if _, err := c.bufr.Peek(4); err != nil {
+			return
+		}
+
+		//nolint:errcheck
+		c.rwc.SetReadDeadline(time.Time{})
 	}
 }
 
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
+// TODO readRequest is incomplete
 func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	return nil, err
 }
@@ -2061,4 +2292,38 @@ func (bl bodyLocked) Read(p []byte) (n int, err error) {
 	}
 
 	return bl.b.readLocked(p)
+}
+
+// serverHandler delegates to either the server's Handler or
+// DefaultServeMux and also handles "OPTIONS *" requests.
+type serverHandler struct {
+	srv *MiniServer
+}
+
+func (sh serverHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	handler := sh.srv.Handler
+
+	if !sh.srv.DisableGeneralOptionsHandler && req.RequestURI == "*" && req.Method == http.MethodOptions {
+		handler = globalOptionsHandler{}
+	}
+
+	handler.ServeHTTP(rw, req)
+}
+
+// globalOptionsHandler responds to "OPTIONS *" requests.
+type globalOptionsHandler struct{}
+
+func (globalOptionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Length", "0")
+
+	if r.ContentLength != 0 {
+		// Read up to 4KB of OPTIONS body (as mentioned in the
+		// spec as being reserved for future use), but anything
+		// over that is considered a waste of server resources
+		// (or an attack) and we abort and close the connection,
+		// courtesy of MaxBytesReader's EOF behavior.
+		mb := http.MaxBytesReader(w, r.Body, 4<<10)
+		//nolint:errcheck
+		io.Copy(io.Discard, mb)
+	}
 }
