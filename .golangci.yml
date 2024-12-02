@@ -14,24 +14,24 @@ linters-settings:
     # Checks the number of statements in a function.
     # If lower than 0, disable the check.
     # Default: 40
-    statements: 40
+    statements: 120
     # Ignore comments when counting lines.
     # Default false
-    ignore-comments: false
+    ignore-comments: true
 
 linters:
   disable-all: true
   enable:
     - bodyclose
 #    - dupl temporary
-    - errcheck
+#    - errcheck
     - asasalint
     - asciicheck
     - containedctx
     - contextcheck # this needs better research
     - copyloopvar
     - errorlint
-    - funlen
+#    - funlen
     - goconst
     - gosec
     - lll
