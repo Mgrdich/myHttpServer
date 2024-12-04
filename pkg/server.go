@@ -80,6 +80,10 @@ const closeStr = "close"
 // This timeout is somewhat arbitrary (~latency around the planet).
 const rstAvoidanceDelay = 500 * time.Millisecond
 
+// This should be >= 512 bytes for DetectContentType,
+// but otherwise it's somewhat arbitrary.
+const bufferBeforeChunkingSize = 2048
+
 type conn struct {
 	// server is the server on which the connection arrived.
 	// Immutable; never nil.
@@ -109,6 +113,10 @@ type conn struct {
 
 	// bufw writes to checkConnErrorWriter{c}, which populates werr on error.
 	bufw *bufio.Writer
+
+	// tlsState is the TLS connection state when using TLS.
+	// nil means not TLS.
+	tlsState *tls.ConnectionState
 
 	// lastMethod is the method of the most recent request
 	// on this connection, if any.
@@ -1416,6 +1424,7 @@ func (c *conn) serve(ctx context.Context) {
 	}()
 
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
+		// TODO tls and h2 support
 		fmt.Println(tlsConn)
 	}
 
@@ -1583,6 +1592,25 @@ func (c *conn) serve(ctx context.Context) {
 	}
 }
 
+// http1ServerSupportsRequest reports whether Go's HTTP/1.x server
+// supports the given request.
+func http1ServerSupportsRequest(req *http.Request) bool {
+	if req.ProtoMajor == 1 {
+		return true
+	}
+
+	// Accept "PRI * HTTP/2.0" upgrade requests, so Handlers can
+	// wire up their own HTTP/2 upgrades.
+	if req.ProtoMajor == 2 && req.ProtoMinor == 0 &&
+		req.Method == "PRI" && req.RequestURI == "*" {
+		return true
+	}
+
+	// Reject HTTP/0.x, and all other HTTP/2+ requests (which
+	// aren't encoded in ASCII anyway).
+	return false
+}
+
 var textprotoReaderPool sync.Pool
 
 func newTextprotoReader(br *bufio.Reader) *textproto.Reader {
@@ -1648,9 +1676,81 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		return nil, err
 	}
 
-	fmt.Println(req, wholeReqDeadline)
+	if !http1ServerSupportsRequest(req) {
+		return nil, statusError{http.StatusHTTPVersionNotSupported, "unsupported protocol version"}
+	}
 
-	return nil, nil
+	c.lastMethod = req.Method
+	c.r.setInfiniteReadLimit()
+
+	hosts, haveHost := req.Header["Host"]
+	isH2Upgraded := isH2Upgrade(req)
+
+	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgraded && req.Method != http.MethodConnect {
+		return nil, badRequestError("missing required Host header")
+	}
+
+	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
+		return nil, badRequestError("malformed Host header")
+	}
+
+	for k, vv := range req.Header {
+		if !httpguts.ValidHeaderFieldName(k) {
+			return nil, badRequestError("invalid header name")
+		}
+
+		for _, v := range vv {
+			if !httpguts.ValidHeaderFieldValue(v) {
+				return nil, badRequestError("invalid header value")
+			}
+		}
+	}
+
+	delete(req.Header, "Host")
+
+	ctx, cancelCtx := context.WithCancel(ctx)
+
+	// override context since ctx is a private variable
+	// remove this line if it does not work
+	req = req.WithContext(ctx)
+
+	req.RemoteAddr = c.remoteAddr
+	req.TLS = c.tlsState
+
+	if body, ok := req.Body.(*body); ok {
+		body.doEarlyClose = true
+	}
+
+	// Adjust the read deadline if necessary.
+	if !hdrDeadline.Equal(wholeReqDeadline) {
+		//nolint:errcheck
+		c.rwc.SetReadDeadline(wholeReqDeadline)
+	}
+
+	w = &response{
+		conn:          c,
+		cancelCtx:     cancelCtx,
+		req:           req,
+		reqBody:       req.Body,
+		handlerHeader: make(http.Header),
+		contentLength: -1,
+		closeNotifyCh: make(chan bool, 1),
+
+		// We populate these ahead of time so we're not
+		// reading from req.Header after their Handler starts
+		// and maybe mutates it (Issue 14940)
+		wants10KeepAlive: wantsHttp10KeepAlive(req),
+		wantsClose:       wantsClose(req),
+	}
+
+	if isH2Upgraded {
+		w.closeAfterReply = true
+	}
+
+	w.cw.res = w
+	w.w = newBufioWriterSize(&w.cw, bufferBeforeChunkingSize)
+
+	return w, nil
 }
 
 func (c *conn) close() {

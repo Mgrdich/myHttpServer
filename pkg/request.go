@@ -128,3 +128,43 @@ func readRequest(b *bufio.Reader) (req *http.Request, err error) {
 
 	return req, nil
 }
+
+// isH2Upgrade reports whether r represents the http2 "client preface"
+// magic string.
+func isH2Upgrade(r *http.Request) bool {
+	return r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0"
+}
+
+func ExpectsContinue(r *http.Request) bool {
+	return hasToken(GetHeader(r.Header, "Expect"), "100-continue")
+}
+
+func GetHeader(h http.Header, key string) string {
+	if v := h[key]; len(v) > 0 {
+		return v[0]
+	}
+
+	return ""
+}
+
+func HasHeader(h http.Header, key string) bool {
+	_, ok := h[key]
+
+	return ok
+}
+
+func wantsHttp10KeepAlive(r *http.Request) bool {
+	if r.ProtoMajor != 1 || r.ProtoMinor != 0 {
+		return false
+	}
+
+	return hasToken(GetHeader(r.Header, "Connection"), "keep-alive")
+}
+
+func wantsClose(r *http.Request) bool {
+	if r.Close {
+		return true
+	}
+
+	return hasToken(GetHeader(r.Header, "Connection"), "close")
+}

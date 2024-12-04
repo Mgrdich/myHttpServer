@@ -2,26 +2,11 @@ package pkg
 
 import (
 	"fmt"
-	"net/http"
 	"strings"
 
 	"golang.org/x/net/http/httpguts"
 	"myHttpServer/internal"
 )
-
-func GetHeader(h http.Header, key string) string {
-	if v := h[key]; len(v) > 0 {
-		return v[0]
-	}
-
-	return ""
-}
-
-func HasHeader(h http.Header, key string) bool {
-	_, ok := h[key]
-
-	return ok
-}
 
 // hasToken reports whether token appears with v, ASCII
 // case-insensitive, with space or comma boundaries.
@@ -69,10 +54,6 @@ func isTokenBoundary(b byte) bool {
 	return b == ' ' || b == ',' || b == '\t'
 }
 
-func ExpectsContinue(r *http.Request) bool {
-	return hasToken(GetHeader(r.Header, "Expect"), "100-continue")
-}
-
 func NumLeadingCRorLF(v []byte) (n int) {
 	for _, b := range v {
 		if b == '\r' || b == '\n' {
@@ -109,10 +90,4 @@ func ValidMethod(method string) bool {
 	     token          = 1*<any CHAR except CTLs or separators>
 	*/
 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
-}
-
-// isH2Upgrade reports whether r represents the http2 "client preface"
-// magic string.
-func isH2Upgrade(r *http.Request) bool {
-	return r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0"
 }
