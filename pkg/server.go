@@ -67,6 +67,8 @@ var (
 	headerDate          = []byte("Date: ")
 )
 
+var errTooLarge = errors.New("http: request too large")
+
 const closeStr = "close"
 
 // rstAvoidanceDelay is the amount of time we sleep after closing the
@@ -219,21 +221,6 @@ type chunkWriter struct {
 
 	// set by the writeHeader method:
 	chunking bool // using chunked transfer encoding for reply body
-}
-
-// bodyAllowedForStatus reports whether a given response status code
-// permits a body. See RFC 7230, section 3.3.
-func bodyAllowedForStatus(status int) bool {
-	switch {
-	case status >= 100 && status <= 199:
-		return false
-	case status == 204:
-		return false
-	case status == 304:
-		return false
-	}
-
-	return true
 }
 
 // foreachHeaderElement splits v according to the "#rule" construction
@@ -904,6 +891,14 @@ func (s *MiniServer) doKeepAlives() bool {
 func (s *MiniServer) idleTimeout() time.Duration {
 	if s.IdleTimeout != 0 {
 		return s.IdleTimeout
+	}
+
+	return s.ReadTimeout
+}
+
+func (s *MiniServer) readHeaderTimeout() time.Duration {
+	if s.ReadHeaderTimeout != 0 {
+		return s.ReadHeaderTimeout
 	}
 
 	return s.ReadTimeout
@@ -1588,12 +1583,74 @@ func (c *conn) serve(ctx context.Context) {
 	}
 }
 
-var errTooLarge = errors.New("http: request too large")
+var textprotoReaderPool sync.Pool
+
+func newTextprotoReader(br *bufio.Reader) *textproto.Reader {
+	if v := textprotoReaderPool.Get(); v != nil {
+		tr := v.(*textproto.Reader)
+		tr.R = br
+
+		return tr
+	}
+
+	return textproto.NewReader(br)
+}
+
+func putTextprotoReader(r *textproto.Reader) {
+	r.R = nil
+
+	textprotoReaderPool.Put(r)
+}
 
 // Read next request from connection.
 // TODO readRequest is incomplete
 func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
-	return nil, err
+	var (
+		wholeReqDeadline time.Time // or zero if none
+		hdrDeadline      time.Time // or zero if none
+	)
+
+	t0 := time.Now()
+
+	if d := c.server.readHeaderTimeout(); d > 0 {
+		hdrDeadline = t0.Add(d)
+	}
+
+	if d := c.server.ReadTimeout; d > 0 {
+		wholeReqDeadline = t0.Add(d)
+	}
+
+	//nolint:errcheck
+	c.rwc.SetReadDeadline(hdrDeadline)
+
+	if d := c.server.WriteTimeout; d > 0 {
+		defer func() {
+			//nolint:errcheck
+			c.rwc.SetWriteDeadline(time.Now().Add(d))
+		}()
+	}
+
+	c.r.setReadLimit(c.server.initialReadLimitSize())
+
+	if c.lastMethod == http.MethodPost {
+		// RFC 7230 section 3 tolerance for old buggy clients.
+		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
+		//nolint:errcheck
+		c.bufr.Discard(NumLeadingCRorLF(peek))
+	}
+
+	req, err := readRequest(c.bufr)
+	if err != nil {
+		if c.r.hitReadLimit() {
+			return nil, errTooLarge
+		}
+
+		return nil, err
+	}
+
+	fmt.Println(req, wholeReqDeadline)
+
+	return nil, nil
 }
 
 func (c *conn) close() {

@@ -1,8 +1,11 @@
 package pkg
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
+	"golang.org/x/net/http/httpguts"
 	"myHttpServer/internal"
 )
 
@@ -68,4 +71,48 @@ func isTokenBoundary(b byte) bool {
 
 func ExpectsContinue(r *http.Request) bool {
 	return hasToken(GetHeader(r.Header, "Expect"), "100-continue")
+}
+
+func NumLeadingCRorLF(v []byte) (n int) {
+	for _, b := range v {
+		if b == '\r' || b == '\n' {
+			n++
+			continue
+		}
+
+		break
+	}
+
+	return
+}
+
+func badStringError(what, val string) error {
+	return fmt.Errorf("%s %q", what, val)
+}
+
+func isNotToken(r rune) bool {
+	return !httpguts.IsTokenRune(r)
+}
+
+func ValidMethod(method string) bool {
+	/*
+	     Method         = "OPTIONS"                ; Section 9.2
+	                    | "GET"                    ; Section 9.3
+	                    | "HEAD"                   ; Section 9.4
+	                    | "POST"                   ; Section 9.5
+	                    | "PUT"                    ; Section 9.6
+	                    | "DELETE"                 ; Section 9.7
+	                    | "TRACE"                  ; Section 9.8
+	                    | "CONNECT"                ; Section 9.9
+	                    | extension-method
+	   extension-method = token
+	     token          = 1*<any CHAR except CTLs or separators>
+	*/
+	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+}
+
+// isH2Upgrade reports whether r represents the http2 "client preface"
+// magic string.
+func isH2Upgrade(r *http.Request) bool {
+	return r.Method == "PRI" && len(r.Header) == 0 && r.URL.Path == "*" && r.Proto == "HTTP/2.0"
 }

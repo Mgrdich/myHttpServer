@@ -18,3 +18,11 @@ func isProtocolSwitchHeader(h http.Header) bool {
 func isProtocolSwitchResponse(code int, h http.Header) bool {
 	return code == http.StatusSwitchingProtocols && isProtocolSwitchHeader(h)
 }
+
+func fixPragmaCacheControl(header http.Header) {
+	if hp, ok := header["Pragma"]; ok && len(hp) > 0 && hp[0] == "no-cache" {
+		if _, presentcc := header["Cache-Control"]; !presentcc {
+			header["Cache-Control"] = []string{"no-cache"}
+		}
+	}
+}
