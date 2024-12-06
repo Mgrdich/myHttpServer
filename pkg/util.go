@@ -114,3 +114,13 @@ func validNextProto(proto string) bool {
 
 	return true
 }
+
+func strSliceContains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+
+	return false
+}

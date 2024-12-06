@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 
@@ -8,29 +9,32 @@ import (
 )
 
 func main() {
-	// own package
-	//err := pkg.ListenAndServerTLS(
-	//	"https://127.0.0.1:8080",
-	//	"server.crt",
-	//	"server.key",
-	//	true,
-	//	http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	//		log.Println(w, r)
-	//	}))
-	//
-	//if err != nil {
-	//	log.Panic(err)
-	//}
-	err := pkg.ListenAndServer("127.0.0.1:8080",
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, err := w.Write([]byte("Hello World"))
+	// Define flags
+	addr := flag.String("addr", ":8080", "Address to listen on")
+	useTLS := flag.Bool("tls", false, "Enable TLS (true/false)")
 
-			if err != nil {
-				return
-			}
-		}))
+	flag.Parse()
 
-	if err != nil {
-		log.Panic(err)
+	// Define the handler
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := w.Write([]byte("Hello World"))
+		if err != nil {
+			log.Printf("Error writing response: %v", err)
+		}
+	})
+
+	// Conditional logic based on the useTLS flag
+	if *useTLS {
+		log.Printf("Starting server with TLS on %s", *addr)
+		err := pkg.ListenAndServeTLS(*addr, "server.crt", "server.key", true, handler)
+		if err != nil {
+			log.Panic(err)
+		}
+	} else {
+		log.Printf("Starting server without TLS on %s", *addr)
+		err := pkg.ListenAndServe(*addr, handler)
+		if err != nil {
+			log.Panic(err)
+		}
 	}
 }

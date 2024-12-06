@@ -144,9 +144,14 @@ type MiniServer struct {
 	// otherwise responds with 200 OK and Content-Length: 0.
 	DisableGeneralOptionsHandler bool
 
-	// Certificate is a replacement of the tls config since the server does not needed to be configured
-	// to the absolute
-	Certificate tls.Certificate
+	// TLSConfig optionally provides a TLS configuration for use
+	// by ServeTLS and ListenAndServeTLS. Note that this value is
+	// cloned by ServeTLS and ListenAndServeTLS, so it's not
+	// possible to modify the configuration with methods like
+	// tls.Config.SetSessionTicketKeys. To use
+	// SetSessionTicketKeys, use Server.Serve with a TLS Listener
+	// instead.
+	TLSConfig *tls.Config
 
 	// SupportH2 whether the current server should support HTTP/2.0
 	SupportH2 bool
@@ -207,6 +212,9 @@ type MiniServer struct {
 	// If TLSNextProto is not nil, HTTP/2 support is not enabled
 	// automatically.
 	TLSNextProto map[string]func(*MiniServer, *tls.Conn, http.Handler)
+
+	nextProtoOnce sync.Once // guards setupHTTP2_* init
+	nextProtoErr  error     // result of http2.ConfigureServer if used
 
 	disableKeepAlives atomic.Bool
 
@@ -735,8 +743,8 @@ type response struct {
 	didCloseNotify atomic.Bool // atomic (only false->true winner should send)
 }
 
-// ListenAndServer it creates HTTP server that works with HTTP/1.1 protocol
-func ListenAndServer(addr string, handler http.Handler) error {
+// ListenAndServe it creates HTTP server that works with HTTP/1.1 protocol
+func ListenAndServe(addr string, handler http.Handler) error {
 	if handler == nil {
 		log.Panic("handler can't be nil")
 	}
@@ -747,8 +755,9 @@ func ListenAndServer(addr string, handler http.Handler) error {
 }
 
 // ListenAndServerTLS it creates HTTP server that has TLS in it works with HTTP/2.0 and HTTP/1.1
-func ListenAndServerTLS(
-	addr string, certFile, keyFile string,
+func ListenAndServeTLS(
+	addr string,
+	certFile, keyFile string,
 	supportH2 bool,
 	handler http.Handler) error {
 	if handler == nil {
@@ -762,6 +771,17 @@ func ListenAndServerTLS(
 	}
 
 	return s.ListenAndServerTLS(certFile, keyFile)
+}
+
+// cloneTLSConfig returns a shallow clone of cfg, or a new zero tls.Config if
+// cfg is nil. This is safe to call even if cfg is in active use by a TLS
+// client or server.
+func cloneTLSConfig(cfg *tls.Config) *tls.Config {
+	if cfg == nil {
+		return &tls.Config{}
+	}
+
+	return cfg.Clone()
 }
 
 func (s *MiniServer) ListenAndServer() error {
@@ -815,6 +835,34 @@ func (oc *onceCloseListener) close() {
 
 // MiniServer Methods
 
+// onceSetNextProtoDefaults configures HTTP/2, if the user hasn't
+// configured otherwise. (by setting srv.TLSNextProto non-nil)
+// It must only be called via srv.nextProtoOnce (use srv.setupHTTP2_*).
+func (s *MiniServer) onceSetNextProtoDefaults() {
+	if !s.SupportH2 {
+		return
+	}
+
+	// Enable HTTP/2 by default if the user hasn't otherwise
+	// configured their TLSNextProto map.
+	if s.TLSNextProto == nil {
+		//conf := &http2Server{
+		//	NewWriteScheduler: func() http2WriteScheduler { return http2NewPriorityWriteScheduler(nil) },
+		//}
+		//s.nextProtoErr = http2ConfigureServer(srv, conf)
+		log.Println("http2 not implemented yet sorry")
+	}
+}
+
+// setupHTTP2_ServeTLS conditionally configures HTTP/2 on
+// srv and reports whether there was an error setting it up. If it is
+// not configured for policy reasons, nil is returned.
+func (s *MiniServer) setupHTTP2ServeTLS() error {
+	s.nextProtoOnce.Do(s.onceSetNextProtoDefaults)
+
+	return s.nextProtoErr
+}
+
 func (s *MiniServer) Serve(l net.Listener) error {
 	if s.shuttingDown() {
 		return http.ErrServerClosed
@@ -867,19 +915,29 @@ func (s *MiniServer) Serve(l net.Listener) error {
 }
 
 func (s *MiniServer) ServeTLS(ln net.Listener, certFile, keyFile string) error {
-	if s.shuttingDown() {
-		return http.ErrServerClosed
+	// Setup HTTP/2 before srv.Serve, to initialize srv.TLSConfig
+	// before we clone it and create the TLS Listener.
+	if err := s.setupHTTP2ServeTLS(); err != nil {
+		return err
+	}
+
+	config := cloneTLSConfig(s.TLSConfig)
+	if !strSliceContains(config.NextProtos, "http/1.1") {
+		config.NextProtos = append(config.NextProtos, "http/1.1")
 	}
 
 	var err error
 
-	s.Certificate, err = tls.LoadX509KeyPair(certFile, keyFile)
+	config.Certificates = make([]tls.Certificate, 1)
+	config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
 
 	if err != nil {
 		return err
 	}
 
-	return s.Serve(ln)
+	tlsListener := tls.NewListener(ln, config)
+
+	return s.Serve(tlsListener)
 }
 
 func (s *MiniServer) shuttingDown() bool {
@@ -1427,7 +1485,6 @@ func requestBodyRemains(rc io.ReadCloser) bool {
 	}
 }
 
-// TODO serve is incomplete
 func (c *conn) serve(ctx context.Context) {
 	if ra := c.rwc.RemoteAddr(); ra != nil {
 		c.remoteAddr = ra.String()

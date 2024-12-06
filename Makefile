@@ -7,6 +7,9 @@ lint: vet
 test:
 	go test -v ./...
 
+build:
+	CGO_ENABLED=0 go build -o main-exec cmd/main.go
+
 build_ci:
 	CGO_ENABLED=0 GOOS=linux go build -o main-exec cmd/main.go
 
