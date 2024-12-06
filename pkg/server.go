@@ -754,7 +754,7 @@ func ListenAndServe(addr string, handler http.Handler) error {
 	return s.ListenAndServer()
 }
 
-// ListenAndServerTLS it creates HTTP server that has TLS in it works with HTTP/2.0 and HTTP/1.1
+// ListenAndServeTLS it creates HTTP server that has TLS in it works with HTTP/2.0 and HTTP/1.1
 func ListenAndServeTLS(
 	addr string,
 	certFile, keyFile string,
@@ -1116,7 +1116,6 @@ func checkWriteHeaderCode(code int) {
 }
 
 func (w *response) sendExpectationFailed() {
-	// TODO(bradfitz): let ServeHTTP handlers handle
 	// requests with non-standard expectation[s]? Seems
 	// theoretical at best, and doesn't fit into the
 	// current ServeHTTP model anyway. We'd need to
@@ -1205,7 +1204,7 @@ func (w *response) bodyAllowed() bool {
 //     and populates c.werr with it if so, but otherwise writes to ->
 //  6. the rwc, the net.Conn.
 //
-// TODO(bradfitz): short-circuit some of the buffering when the
+
 // initial header contains both a Content-Type and Content-Length.
 // Also short-circuit in (1) when the header's been sent and not in
 // chunking mode, writing directly to (4) instead, if (2) has no
