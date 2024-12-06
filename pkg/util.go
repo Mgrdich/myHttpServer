@@ -91,3 +91,26 @@ func ValidMethod(method string) bool {
 	*/
 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
 }
+
+// tlsRecordHeaderLooksLikeHTTP reports whether a TLS record header
+// looks like it might've been a misdirected plaintext HTTP request.
+func tlsRecordHeaderLooksLikeHTTP(hdr [5]byte) bool {
+	switch string(hdr[:]) {
+	case "GET /", "HEAD ", "POST ", "PUT /", "OPTIO":
+		return true
+	}
+
+	return false
+}
+
+// validNextProto reports whether the proto is a valid ALPN protocol name.
+// Everything is valid except the empty string and built-in protocol types,
+// so that those can't be overridden with alternate implementations.
+func validNextProto(proto string) bool {
+	switch proto {
+	case "", "http/1.1", "http/1.0":
+		return false
+	}
+
+	return true
+}

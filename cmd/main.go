@@ -23,7 +23,11 @@ func main() {
 	//}
 	err := pkg.ListenAndServer("127.0.0.1:8080",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte("Hello World"))
+			_, err := w.Write([]byte("Hello World"))
+
+			if err != nil {
+				return
+			}
 		}))
 
 	if err != nil {

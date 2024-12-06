@@ -197,6 +197,17 @@ type MiniServer struct {
 	// If nil, logging is done via the log package's standard logger.
 	ErrorLog *log.Logger
 
+	// TLSNextProto optionally specifies a function to take over
+	// ownership of the provided TLS connection when an ALPN
+	// protocol upgrade has occurred. The map key is the protocol
+	// name negotiated. The Handler argument should be used to
+	// handle HTTP requests and will initialize the Request's TLS
+	// and RemoteAddr if not already set. The connection is
+	// automatically closed when the function returns.
+	// If TLSNextProto is not nil, HTTP/2 support is not enabled
+	// automatically.
+	TLSNextProto map[string]func(*MiniServer, *tls.Conn, http.Handler)
+
 	disableKeepAlives atomic.Bool
 
 	mu         sync.Mutex
@@ -912,6 +923,31 @@ func (s *MiniServer) readHeaderTimeout() time.Duration {
 	return s.ReadTimeout
 }
 
+// tlsHandshakeTimeout returns the time limit permitted for the TLS
+// handshake, or zero for unlimited.
+//
+// It returns the minimum of any positive ReadHeaderTimeout,
+// ReadTimeout, or WriteTimeout.
+func (s *MiniServer) tlsHandshakeTimeout() time.Duration {
+	var ret time.Duration
+
+	for _, v := range [...]time.Duration{
+		s.ReadHeaderTimeout,
+		s.ReadTimeout,
+		s.WriteTimeout,
+	} {
+		if v <= 0 {
+			continue
+		}
+
+		if ret == 0 || v < ret {
+			ret = v
+		}
+	}
+
+	return ret
+}
+
 // A ConnState represents the state of a client connection to a server.
 // It's used by the optional Server.ConnState hook.
 type ConnState int
@@ -1424,8 +1460,66 @@ func (c *conn) serve(ctx context.Context) {
 	}()
 
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
-		// TODO tls and h2 support
-		fmt.Println(tlsConn)
+		tlsTO := c.server.tlsHandshakeTimeout()
+
+		if tlsTO > 0 {
+			dl := time.Now().Add(tlsTO)
+			//nolint:errcheck
+			c.rwc.SetReadDeadline(dl)
+			//nolint:errcheck
+			c.rwc.SetWriteDeadline(dl)
+		}
+
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			// If the handshake failed due to the client not speaking
+			// TLS, assume they're speaking plaintext HTTP and write a
+			// 400 response on the TLS conn's underlying net.Conn.
+			var re tls.RecordHeaderError
+			if errors.As(err, &re) && re.Conn != nil && tlsRecordHeaderLooksLikeHTTP(re.RecordHeader) {
+				//nolint:errcheck
+				io.WriteString(re.Conn, "HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n")
+				//nolint:errcheck
+				re.Conn.Close()
+
+				return
+			}
+
+			c.server.logf("http: TLS handshake error from %s: %v", c.rwc.RemoteAddr(), err)
+
+			return
+		}
+
+		// Restore Conn-level deadlines.
+		if tlsTO > 0 {
+			//nolint:errcheck
+			c.rwc.SetReadDeadline(time.Time{})
+			//nolint:errcheck
+			c.rwc.SetWriteDeadline(time.Time{})
+		}
+
+		// Restore Conn-level deadlines.
+		if tlsTO > 0 {
+			//nolint:errcheck
+			c.rwc.SetReadDeadline(time.Time{})
+			//nolint:errcheck
+			c.rwc.SetWriteDeadline(time.Time{})
+		}
+
+		c.tlsState = new(tls.ConnectionState)
+		*c.tlsState = tlsConn.ConnectionState()
+
+		if proto := c.tlsState.NegotiatedProtocol; validNextProto(proto) {
+			if fn := c.server.TLSNextProto[proto]; fn != nil {
+				h := initALPNRequest{ctx, tlsConn, serverHandler{c.server}}
+				// Mark freshly created HTTP/2 as active and prevent any server state hooks
+				// from being run on these connections. This prevents closeIdleConns from
+				// closing such connections.
+				c.setState(StateActive)
+				fn(c.server, tlsConn, h)
+			}
+
+			return
+		}
 	}
 
 	// HTTP/1.x from here on
@@ -2483,4 +2577,37 @@ func (globalOptionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		//nolint:errcheck
 		io.Copy(io.Discard, mb)
 	}
+}
+
+// initALPNRequest is an HTTP handler that initializes certain
+// uninitialized fields in its *Request. Such partially-initialized
+// Requests come from ALPN protocol handlers.
+type initALPNRequest struct {
+	//nolint:containedctx
+	ctx context.Context
+	c   *tls.Conn
+	h   serverHandler
+}
+
+// BaseContext is an exported but unadvertised http.Handler method
+// recognized by x/net/http2 to pass down a context; the TLSNextProto
+// API predates context support so we shoehorn through the only
+// interface we have available.
+func (h initALPNRequest) BaseContext() context.Context { return h.ctx }
+
+func (h initALPNRequest) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if req.TLS == nil {
+		req.TLS = &tls.ConnectionState{}
+		*req.TLS = h.c.ConnectionState()
+	}
+
+	if req.Body == nil {
+		req.Body = http.NoBody
+	}
+
+	if req.RemoteAddr == "" {
+		req.RemoteAddr = h.c.RemoteAddr().String()
+	}
+
+	h.h.ServeHTTP(rw, req)
 }
