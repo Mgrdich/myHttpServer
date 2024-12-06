@@ -778,6 +778,7 @@ func ListenAndServeTLS(
 // client or server.
 func cloneTLSConfig(cfg *tls.Config) *tls.Config {
 	if cfg == nil {
+		//nolint:gosec
 		return &tls.Config{}
 	}
 

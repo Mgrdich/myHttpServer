@@ -18,6 +18,7 @@ func main() {
 	// Define the handler
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, err := w.Write([]byte("Hello World"))
+
 		if err != nil {
 			log.Printf("Error writing response: %v", err)
 		}
@@ -27,12 +28,14 @@ func main() {
 	if *useTLS {
 		log.Printf("Starting server with TLS on %s", *addr)
 		err := pkg.ListenAndServeTLS(*addr, "server.crt", "server.key", true, handler)
+
 		if err != nil {
 			log.Panic(err)
 		}
 	} else {
 		log.Printf("Starting server without TLS on %s", *addr)
 		err := pkg.ListenAndServe(*addr, handler)
+
 		if err != nil {
 			log.Panic(err)
 		}
